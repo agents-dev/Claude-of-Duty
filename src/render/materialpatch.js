@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { csmShaderChunk } from './csm.js';
+import { createBakedUniforms } from './staticshadows.js';
 
 /**
  * Every lit material in the game gets four things injected into it:
@@ -35,6 +36,7 @@ export class MaterialPatcher {
 
     this.uniforms = {
       ...csmUniforms,
+      ...createBakedUniforms(),
       owAoTex: { value: null },
       owContactTex: { value: null },
       owSsrTex: { value: null },
@@ -70,8 +72,39 @@ export class MaterialPatcher {
     this.chunk = csmShaderChunk(opts.cascades, opts.quality);
     this.rooms = this.uniforms.owRooms.value;
     this.roomsY = this.uniforms.owRoomsY.value;
-    this._patched = new WeakSet();
+    /** Every material ever patched, so a runtime quality switch can rekey them. */
+    this._patchedMaterials = new Set();
     this.count = 0;
+  }
+
+  /**
+   * Rebuild the injected chunk for a new cascade count / quality level and
+   * re-key the program cache. The caller sets `needsUpdate` on every material
+   * in `materials()` afterwards; the patched `onBeforeCompile` and cache-key
+   * closures read `this` live, so already-patched materials pick the new chunk
+   * up on recompile with no re-patching.
+   */
+  setQuality(cascades, quality) {
+    if (cascades === this.cascades && quality === this.quality) return false;
+    this.cascades = cascades;
+    this.quality = quality;
+    this.chunk = csmShaderChunk(cascades, quality);
+    this.key = `ow-patch-${PATCH_VERSION}-${cascades}-${quality}`;
+    return true;
+  }
+
+  /** Live iterable of patched materials (for rekey + needsUpdate). */
+  materials() {
+    return this._patchedMaterials;
+  }
+
+  /**
+   * Re-point the shared CSM uniform objects after the cascade set is rebuilt
+   * (runtime quality switch disposes and recreates it). The baked-shadow
+   * uniforms are owned here and are left alone.
+   */
+  relinkCsm(csmUniforms) {
+    for (const k in csmUniforms) this.uniforms[k] = csmUniforms[k];
   }
 
   /** True for materials that run three's lighting pipeline. */
@@ -87,25 +120,23 @@ export class MaterialPatcher {
   }
 
   patch(material) {
-    if (!material || this._patched.has(material)) return false;
+    if (!material || this._patchedMaterials.has(material)) return false;
     if (!MaterialPatcher.isLit(material)) return false;
     if (material.userData?.owNoPatch) return false;
-    this._patched.add(material);
+    this._patchedMaterials.add(material);
     this.count++;
 
-    const uniforms = this.uniforms;
-    const parsChunk = this.chunk + EXTRA_PARS;
+    const self = this;
     const prevHook = material.onBeforeCompile;
     const prevKey = material.customProgramCacheKey;
-    const key = this.key;
 
     material.onBeforeCompile = function (shader, renderer) {
       if (typeof prevHook === 'function') prevHook.call(this, shader, renderer);
-      for (const k in uniforms) shader.uniforms[k] = uniforms[k];
+      for (const k in self.uniforms) shader.uniforms[k] = self.uniforms[k];
 
       shader.fragmentShader = shader.fragmentShader.replace(
         '#include <lights_pars_begin>',
-        '#include <lights_pars_begin>\n' + parsChunk
+        '#include <lights_pars_begin>\n' + self.chunk + EXTRA_PARS
       );
 
       // Inject the sun shadow inside the (unrolled) directional light loop.
@@ -205,7 +236,7 @@ export class MaterialPatcher {
 
     material.customProgramCacheKey = function () {
       const base = typeof prevKey === 'function' ? prevKey.call(this) : '';
-      return key + base;
+      return self.key + base;
     };
 
     material.needsUpdate = true;
@@ -217,7 +248,7 @@ export class MaterialPatcher {
   }
 
   dispose() {
-    this._patched = new WeakSet();
+    this._patchedMaterials.clear();
   }
 }
 

@@ -53,8 +53,14 @@ export class MaterialSystem {
     const q = ctx?.config?.q;
     this._anisotropy = q?.anisotropy ?? 8;
     // Texture budget scales with the quality preset; 1K is the reference.
+    // Mobile shares the low tier: half-res bakes are a quarter of the memory
+    // traffic, and a 6-inch panel cannot resolve the difference.
     this._quality =
-      ctx?.config?.quality === 'low' ? 0.5 : ctx?.config?.quality === 'medium' ? 0.75 : 1;
+      ctx?.config?.quality === 'low' || ctx?.config?.quality === 'mobile'
+        ? 0.5
+        : ctx?.config?.quality === 'medium'
+          ? 0.75
+          : 1;
     this._tryBuild();
   }
 

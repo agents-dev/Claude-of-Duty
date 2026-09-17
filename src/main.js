@@ -1,5 +1,5 @@
 import { Engine } from './core/engine.js';
-import { createConfig } from './core/config.js';
+import { createConfig, detectMobile } from './core/config.js';
 
 import { RenderSystem } from './render/index.js';
 import { MaterialSystem } from './materials/index.js';
@@ -24,8 +24,13 @@ const capture = params.get('capture') === '1';
 // free-run. See the long comment in src/dev/shots.js.
 const lockstep = capture && params.get('lockstep') === '1';
 
+const mobileParam = params.get('mobile');
+const mobile = mobileParam !== null ? mobileParam !== '0' : detectMobile();
+const touchParam = params.get('touch');
 const config = createConfig({
-  quality: params.get('q') ?? 'ultra',
+  quality: params.get('q') ?? (mobile ? 'mobile' : 'low'),
+  isMobile: mobile,
+  touch: touchParam === 'on' || touchParam === '1' ? 'on' : touchParam === 'off' || touchParam === '0' ? 'off' : 'auto',
   deterministic: capture,
 });
 

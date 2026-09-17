@@ -12,6 +12,7 @@ import { Minimap } from './minimap.js';
 import { WorldMarkers } from './markers.js';
 import { Prompt, Banner } from './prompts.js';
 import { PauseMenu } from './menu.js';
+import { TouchControls } from './touch.js';
 import { CombatDemo } from './demo.js';
 
 const MAX_BLIPS = 48;
@@ -90,6 +91,8 @@ export class UiSystem {
     this.ammo = new AmmoPanel(this.chromeLayer);
     this.prompt = new Prompt(this.chromeLayer);
     this.banner = new Banner(this.chromeLayer);
+    // Touch layer before the menu in DOM order, so the menu overlays it.
+    this.touch = new TouchControls(this.root, ctx);
     this.menu = new PauseMenu(this.root, ctx);
 
     this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
@@ -416,6 +419,7 @@ export class UiSystem {
       }
     }
     this.menu.update(rawDt);
+    this.touch.sync();
 
     // ---- external state --------------------------------------------------
     // `simulate` means a scripted debug timeline owns the HUD numbers; letting
@@ -606,6 +610,7 @@ export class UiSystem {
     this.markers.dispose();
     this.prompt.dispose();
     this.banner.dispose();
+    this.touch.dispose();
     this.menu.dispose();
     this.root.remove();
     removeStyles();

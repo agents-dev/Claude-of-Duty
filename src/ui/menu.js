@@ -1,6 +1,6 @@
 import { el, setText, setStyle, clamp, damp, ease } from './util.js';
 
-const PRESETS = ['low', 'medium', 'high', 'ultra'];
+const PRESETS = ['mobile', 'low', 'medium', 'high', 'ultra'];
 
 /**
  * Pause / settings menu.
@@ -85,7 +85,7 @@ export class PauseMenu {
       this.sens.set(1);
       this.fov.set(80);
       this.ctx.config.invertY = false;
-      this.setQuality('ultra');
+      this.setQuality(this.ctx.config.defaultQuality ?? 'low');
     });
     el('div', 'hint', inner, 'ESC RESUME · WASD MOVE · SHIFT SPRINT · R RELOAD · F USE');
 
@@ -176,7 +176,8 @@ export class PauseMenu {
     const t = this.ctx.time;
     if (t) t.scale = this._prevScale ?? 1;
     this.ctx.peek('player')?.setControlEnabled?.(true);
-    this.ctx.input?.requestPointerLock?.();
+    // Touch devices have no pointer lock; requesting it just errors.
+    if (!this.ctx.input?.touchMode) this.ctx.input?.requestPointerLock?.();
     this.ctx.events.emit('ui:pause', { paused: false });
   }
 

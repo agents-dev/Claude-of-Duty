@@ -679,7 +679,86 @@ const CSS = `
 
 /* ============================================================== fadeouts */
 .ow-hidden { display:none !important; }
-`;
+
+/* ===================================================== touch controls
+   Fixed pixel sizes (thumbs need real millimetres, not HUD scale), safe-area
+   aware so notches and home indicators never cover the fire button. */
+.ow-touch { position:absolute; inset:0; z-index:5; }
+.ow-touch .t-look {
+  position:absolute; inset:0; pointer-events:auto; touch-action:none;
+}
+.ow-touch .t-stick {
+  position:absolute; left: max(18px, env(safe-area-inset-left));
+  bottom: max(90px, calc(env(safe-area-inset-bottom) + 70px));
+  width:150px; height:150px; pointer-events:auto; touch-action:none;
+}
+.ow-touch .t-base {
+  position:absolute; inset:0; border-radius:50%;
+  border:2px solid rgba(255,255,255,.28);
+  background: radial-gradient(circle, rgba(255,255,255,.05) 0%, rgba(255,255,255,.02) 70%, transparent 100%);
+}
+.ow-touch .t-knob {
+  position:absolute; left:50%; top:50%; width:58px; height:58px; border-radius:50%;
+  transform: translate(-50%,-50%);
+  background: rgba(255,255,255,.22);
+  border:2px solid rgba(255,255,255,.5);
+  box-shadow: 0 2px 10px rgba(0,0,0,.5);
+}
+.ow-touch .t-btn {
+  position:absolute; pointer-events:auto; touch-action:none;
+  appearance:none; border-radius:50%;
+  border:2px solid rgba(255,255,255,.35);
+  background: rgba(10,14,18,.42);
+  color: rgba(238,244,247,.92);
+  font-family: var(--ff); font-weight:700; font-size:11px; letter-spacing:.08em;
+  width:56px; height:56px;
+  user-select:none; -webkit-user-select:none; -webkit-touch-callout:none;
+  text-shadow: 0 1px 2px rgba(0,0,0,.9);
+}
+.ow-touch .t-btn.on { background: rgba(255,176,42,.55); border-color: var(--amber); }
+.ow-touch .t-fire {
+  right: max(24px, env(safe-area-inset-right));
+  bottom: max(96px, calc(env(safe-area-inset-bottom) + 76px));
+  width:88px; height:88px; font-size:13px;
+  border-color: rgba(255,122,99,.6);
+}
+.ow-touch .t-fire.on { background: rgba(255,63,49,.5); border-color: var(--red); }
+.ow-touch .t-ads {
+  right: max(128px, calc(env(safe-area-inset-right) + 104px));
+  bottom: max(80px, calc(env(safe-area-inset-bottom) + 60px));
+}
+.ow-touch .t-jump {
+  right: max(30px, env(safe-area-inset-right));
+  bottom: max(200px, calc(env(safe-area-inset-bottom) + 180px));
+}
+.ow-touch .t-small { width:48px; height:48px; font-size:9.5px; opacity:.92; }
+.ow-touch .t-btn.t-small { position:absolute; }
+.ow-touch .t-btn[data-id="reload"] {
+  right: max(128px, calc(env(safe-area-inset-right) + 104px));
+  bottom: max(150px, calc(env(safe-area-inset-bottom) + 130px));
+}
+.ow-touch .t-btn[data-id="crouch"] {
+  right: max(30px, env(safe-area-inset-right));
+  bottom: max(262px, calc(env(safe-area-inset-bottom) + 242px));
+}
+.ow-touch .t-btn[data-id="use"] {
+  right: max(188px, calc(env(safe-area-inset-right) + 164px));
+  bottom: max(96px, calc(env(safe-area-inset-bottom) + 76px));
+}
+.ow-touch .t-btn[data-id="weapon"] {
+  right: max(188px, calc(env(safe-area-inset-right) + 164px));
+  bottom: max(158px, calc(env(safe-area-inset-bottom) + 138px));
+}
+.ow-touch .t-btn[data-id="grenade"] {
+  right: max(80px, calc(env(safe-area-inset-right) + 56px));
+  bottom: max(262px, calc(env(safe-area-inset-bottom) + 242px));
+}
+.ow-touch .t-pause {
+  right: max(14px, env(safe-area-inset-right));
+  top: max(64px, env(safe-area-inset-top));
+  bottom:auto; width:42px; height:42px; opacity:.8;
+}
+`;  
 
 const DEFS = `
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">

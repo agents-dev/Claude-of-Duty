@@ -1,6 +1,12 @@
 /**
- * Input aggregation: keyboard, mouse (pointer-locked), and gamepad, exposed as
- * a stable per-frame snapshot so gameplay never touches raw DOM events.
+ * Input aggregation: keyboard, mouse (pointer-locked), gamepad and touch,
+ * exposed as a stable per-frame snapshot so gameplay never touches raw DOM
+ * events.
+ *
+ * Touch feeds the SAME snapshot: the virtual joystick overwrites the stick
+ * vector, look drags accumulate into the look delta, and buttons inject the
+ * keyboard/mouse codes they mirror — so movement, sprint, fire, ADS and every
+ * edge query work with zero gameplay changes.
  *
  * Edge queries (`pressed`, `released`) are valid only during the frame in which
  * the transition happened — read them in update(), not fixedUpdate().
@@ -50,6 +56,26 @@ export class Input {
 
     this.gamepadIndex = null;
     this.stick = { moveX: 0, moveY: 0, lookX: 0, lookY: 0 };
+
+    // ---- touch -----------------------------------------------------------
+    // touchMode shows the virtual controls; it latches on the first touch but
+    // also honours the coarse-pointer heuristic and the `?touch=` override, so
+    // desktop testing and mobile emulation both behave.
+    this.touchMode = config.touch === 'on';
+    if (config.touch !== 'off' && !this.touchMode) {
+      try {
+        this.touchMode =
+          matchMedia('(pointer: coarse)').matches &&
+          ('ontouchstart' in window || (navigator.maxTouchPoints ?? 0) > 0);
+      } catch {
+        this.touchMode = false;
+      }
+    }
+    /** Virtual joystick state, gamepad-axes convention (up = -y). */
+    this.touchStick = { x: 0, y: 0, active: false };
+    this._touchLook = { x: 0, y: 0 };
+    /** Touch drags cover less ground than a mouse, so they get extra gain. */
+    this.touchLookGain = 2.2;
 
     this._bound = {
       keydown: this._onKeyDown.bind(this),
@@ -147,6 +173,50 @@ export class Input {
     for (const code of this.down) this._pendingUp.add(code);
     this._rawLook.x = 0;
     this._rawLook.y = 0;
+    this._touchLook.x = 0;
+    this._touchLook.y = 0;
+    this.touchStick.x = 0;
+    this.touchStick.y = 0;
+    this.touchStick.active = false;
+  }
+
+  // ---- touch controls (see src/ui/touch.js) -------------------------------
+
+  /** Virtual button held: injects a keyboard/mouse code into the edge queues. */
+  touchDown(code) {
+    if (!this.enabled) return;
+    this.touchMode = true;
+    this._pendingDown.add(code);
+  }
+
+  /** Virtual button released. */
+  touchUp(code) {
+    if (!this.enabled) return;
+    this._pendingUp.add(code);
+  }
+
+  /** Virtual button tapped: down + up across this frame's edge queues. */
+  touchTap(code) {
+    if (!this.enabled) return;
+    this.touchMode = true;
+    this._pendingDown.add(code);
+    this._pendingUp.add(code);
+  }
+
+  /** Look drag in CSS pixels from the touch layer. */
+  addTouchLook(dx, dy) {
+    if (!this.enabled || this.frozen) return;
+    this.touchMode = true;
+    this._touchLook.x += dx;
+    this._touchLook.y += dy;
+  }
+
+  /** Virtual joystick, gamepad-axes convention (up = -y), unit disc. */
+  setTouchStick(x, y, active = true) {
+    this.touchStick.x = x;
+    this.touchStick.y = y;
+    this.touchStick.active = active;
+    if (active) this.touchMode = true;
   }
 
   beginFrame() {
@@ -166,6 +236,11 @@ export class Input {
     this._pendingUp.clear();
 
     const s = this.config.sensitivity;
+    // Touch drags join the mouse delta with extra gain (see touchLookGain).
+    this._rawLook.x += this._touchLook.x * this.touchLookGain;
+    this._rawLook.y += this._touchLook.y * this.touchLookGain;
+    this._touchLook.x = 0;
+    this._touchLook.y = 0;
     this.look.x = this.frozen ? 0 : this._rawLook.x * s;
     this.look.y = this.frozen ? 0 : this._rawLook.y * s * (this.config.invertY ? -1 : 1);
     this._rawLook.x = 0;
@@ -175,6 +250,12 @@ export class Input {
     this._pendingWheel = 0;
 
     this._pollGamepad();
+    // The virtual joystick wins over a gamepad stick: a thumb on glass is
+    // deliberate, a resting gamepad stick is noise.
+    if (this.touchStick.active) {
+      this.stick.moveX = this.touchStick.x;
+      this.stick.moveY = this.touchStick.y;
+    }
   }
 
   endFrame() {}

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 
 import { hdrTarget, blit } from './pass.js';
 import { CascadedShadowMaps } from './csm.js';
+import { StaticShadows, REBAKE_DOT, REBAKE_INTERVAL } from './staticshadows.js';
 import { MaterialPatcher } from './materialpatch.js';
 import { GBuffer } from './prepass.js';
 import { Gtao } from './gtao.js';
@@ -17,7 +18,17 @@ import { createComposite, createFxaa, createDebug, createViewComposite } from '.
 import { buildFallbackEnvironment } from './env.js';
 import { RenderProbeScene } from './probe.js';
 
-const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3 };
+const QUALITY_LEVEL = { low: 0, medium: 1, high: 2, ultra: 3, mobile: 0 };
+
+/** Construct-or-dispose helper for the optional pass set (see applyQuality). */
+function swapPass(cur, want, make) {
+  if (want && !cur) return make();
+  if (!want && cur) {
+    cur.dispose?.();
+    return null;
+  }
+  return cur;
+}
 
 /**
  * Registration range at or below which a punctual light counts as a room/street
@@ -193,6 +204,12 @@ export class RenderSystem {
       cascades: this.csm.cascades,
       quality: this.qLevel,
     });
+    // Baked static sun shadows (low preset): shares the patcher's uniform
+    // objects, so enabling is a uniform flip after the first bake.
+    this.baked = new StaticShadows();
+    this.baked.attach(this.patcher.uniforms);
+    this.baked.setEnabled(!!q.staticShadows);
+    this.csm.enabled = !q.staticShadows;
 
     this.gbuffer = new GBuffer();
     this.gtao = q.gtao ? new Gtao() : null;
@@ -203,7 +220,7 @@ export class RenderSystem {
     // ADS depth of field. Cheap (half-res gather, 32 taps) and only ever runs
     // while the sights are actually up, so it costs nothing in hipfire.
     this.dof = this.qLevel >= 1 ? new DepthOfField() : null;
-    this.bloom = q.bloom ? new Bloom(this.qLevel >= 2 ? 6 : 5) : null;
+    this.bloom = q.bloom ? new Bloom(this._bloomLevels) : null;
     this.exposure = new AutoExposure();
     // Headroom for a physically-scaled sky (sunlit scenes reach ~5000 cd/m2).
     // The lower limit is the night exposure lock: a moonlit street meters at
@@ -219,6 +236,7 @@ export class RenderSystem {
     // edges no longer get a temporal filter, and 4x on a single small pass is
     // far cheaper than any spatial substitute at the same quality.
     this._viewSamples = this.qLevel >= 2 ? 4 : this.qLevel >= 1 ? 2 : 0;
+    this._bloomLevels = this.qLevel >= 2 ? 6 : 5;
 
     // Always on: depthTexture/velocityTexture are part of the public contract
     // (soft particles, SSR, motion blur) even when our own effects are off.
@@ -477,6 +495,13 @@ export class RenderSystem {
     const h = ctx.canvas.clientHeight || 1080;
     this.resize(w, h, ctx);
 
+    // Runtime preset switching. config.setQuality() alone only mutates numbers;
+    // every pipeline object is built once above, so the menu event lands here
+    // where the pipeline can actually be rebuilt (see applyQuality). Boot-time
+    // only: sky march steps, fx budgets/atlases, material texture sizes.
+    this._qualityApplied = cfg.quality;
+    ctx.events.on('ui:quality', (e) => this.applyQuality(e?.quality));
+
     console.info(
       `[render] WebGL2 · ${cfg.quality} · ${this.csm.cascades}x${this.csm.mapSize} CSM · ` +
         `taa:${!!this.taa} gtao:${!!this.gtao} ssr:${!!this.ssr} mb:${!!this.motionBlur}`
@@ -577,6 +602,103 @@ export class RenderSystem {
   }
 
   /**
+   * Switch graphics presets at runtime (pause menu -> `ui:quality`).
+   *
+   * Before this existed the switch was a silent no-op: `config.setQuality()`
+   * rewrote the numbers in `cfg.q` but the cascade set, the compiled program
+   * keys, the allocated passes/targets and the shadow mode all stayed exactly
+   * as booted. This rebuilds everything render owns:
+   *
+   *   - CSM set (cascades / map size / distance), relinked into the patcher
+   *     and the sky march pass, which share its uniform objects by reference;
+   *   - the patcher program key (cascade count and tap counts are shader
+   *     defines), with `needsUpdate` on every patched material so the new
+   *     permutation actually compiles;
+   *   - the optional pass set (GTAO / contact / SSR / TAA+FXAA / motion blur /
+   *     DOF / bloom) constructed or disposed to match;
+   *   - render targets (renderScale, viewmodel MSAA, the LDR intermediate);
+   *   - the shadow mode: baked static map vs dynamic cascades.
+   *
+   * A switch hitches once while the new permutations compile — same price as
+   * boot, paid on demand. Idempotent: re-selecting the active preset is free.
+   */
+  applyQuality(name) {
+    const cfg = this.ctx?.config;
+    if (!cfg || !name) return;
+    if (cfg.quality === name && this._qualityApplied === name) return;
+    cfg.setQuality(name);
+    const q = cfg.q;
+    this.q = q;
+    this.qLevel = QUALITY_LEVEL[cfg.quality] ?? 3;
+
+    // ---- shadow cascades --------------------------------------------------
+    if (
+      q.cascades !== this.csm.cascades ||
+      q.shadowMapSize !== this.csm.mapSize ||
+      q.shadowDistance !== this.csm.maxDistance
+    ) {
+      const nu = new CascadedShadowMaps(this.renderer, {
+        cascades: q.cascades,
+        mapSize: q.shadowMapSize,
+        maxDistance: q.shadowDistance,
+      });
+      nu.enabled = !q.staticShadows;
+      this.patcher.relinkCsm(nu.uniforms);
+      // The sky march pass shares the old uniform objects by reference too.
+      const mu = this.ctx.peek('sky')?.volumetrics?.marchPass?.uniforms;
+      if (mu) for (const k in nu.uniforms) if (k in mu) mu[k] = nu.uniforms[k];
+      this.csm.dispose();
+      this.csm = nu;
+    } else {
+      this.csm.enabled = !q.staticShadows;
+    }
+
+    // ---- programs ----------------------------------------------------------
+    this.patcher.setQuality(this.csm.cascades, this.qLevel);
+    for (const m of this.patcher.materials()) m.needsUpdate = true;
+
+    // ---- optional passes ----------------------------------------------------
+    this.gtao = swapPass(this.gtao, !!q.gtao, () => new Gtao());
+    this.contact = swapPass(this.contact, this.qLevel >= 1, () => new ContactShadows());
+    this.ssr = swapPass(this.ssr, !!q.ssr, () => new Ssr());
+    if (!!q.taa !== !!this.taa) {
+      this.taa?.dispose();
+      this.taa = q.taa ? new Taa() : null;
+      this.fxaa?.dispose();
+      this.fxaa = q.taa ? null : createFxaa();
+    }
+    this.motionBlur = swapPass(this.motionBlur, !!q.motionBlur, () => new MotionBlur());
+    this.dof = swapPass(this.dof, this.qLevel >= 1, () => new DepthOfField());
+    const bloomLevels = this.qLevel >= 2 ? 6 : 5;
+    if (!!q.bloom && (!this.bloom || this._bloomLevels !== bloomLevels)) {
+      this.bloom?.dispose();
+      this.bloom = new Bloom(bloomLevels);
+      this._bloomLevels = bloomLevels;
+    } else if (!q.bloom && this.bloom) {
+      this.bloom.dispose();
+      this.bloom = null;
+    }
+    this._viewSamples = this.qLevel >= 2 ? 4 : this.qLevel >= 1 ? 2 : 0;
+
+    // ---- shadow mode ---------------------------------------------------------
+    this.baked.setEnabled(!!q.staticShadows);
+    if (q.staticShadows) this.baked.baked = false; // re-bake under the new mode
+
+    // ---- targets --------------------------------------------------------------
+    const w = Math.max(1, this.ctx.canvas.clientWidth || innerWidth);
+    const h = Math.max(1, this.ctx.canvas.clientHeight || innerHeight);
+    this.resize(w, h, this.ctx);
+    this.taa?.reset();
+    this.exposure.reset();
+    this._applySettings();
+    this._qualityApplied = name;
+    console.info(
+      `[render] quality -> ${name} · ${this.csm.cascades}x${this.csm.mapSize} CSM${this.csm.enabled ? '' : ' (off, baked statics)'} · ` +
+        `taa:${!!this.taa} gtao:${!!this.gtao} ssr:${!!this.ssr} mb:${!!this.motionBlur}`
+    );
+  }
+
+  /**
    * Compile every program this subsystem can reach, without drawing a gameplay
    * frame. Call it from the loading screen (src/core/prewarm.js).
    *
@@ -645,8 +767,10 @@ export class RenderSystem {
       // 3. Depth-only variants. There is no compile-time API for an override
       //    material, so the only way to reach them is to actually run the two
       //    depth passes once — which is cheap, writes only to buffers the next
-      //    frame clears, and advances nothing.
-      if (shadow) {
+      //    frame clears, and advances nothing. Skipped when the cascades are
+      //    off (low preset: baked statics instead) — the world hook below
+      //    still compiles the same depth variants through `csm.depthMaterial`.
+      if (shadow && this.csm.enabled) {
         const camera = ctx.camera;
         camera.updateMatrixWorld();
         this._collect(ctx.scene);
@@ -847,6 +971,7 @@ export class RenderSystem {
     cu.uLens.value.set(s.chromatic, s.vignette, s.grain, 0);
     cu.uGrade.value.set(s.bloomStrength, s.lutStrength, this.taa ? s.sharpen : 0, this.lut.size);
     this.csm.setStrength(s.shadowStrength);
+    this.patcher.uniforms.owBakedParams.value.y = s.shadowStrength;
     if (this.bloom) {
       this.bloom.threshold = s.bloomThreshold;
       this.bloom.knee = s.bloomKnee;
@@ -866,7 +991,11 @@ export class RenderSystem {
   // ==========================================================================
 
   resize(w, h, ctx) {
-    const pr = Math.min(globalThis.devicePixelRatio || 1, 1.5);
+    // Handheld GPUs drown in fill rate: a 3x phone panel at 1.5x DPR is 9x
+    // the pixels of the render scale budget, so mobile renders at DPR 1 and
+    // lets the small, dense panel hide it.
+    const dprCap = ctx?.config?.isMobile ? 1 : 1.5;
+    const pr = Math.min(globalThis.devicePixelRatio || 1, dprCap);
     this.renderer.setPixelRatio(pr);
     this.renderer.setSize(w, h, false);
 
@@ -1261,6 +1390,78 @@ export class RenderSystem {
   }
 
   // ==========================================================================
+  //  baked static shadows (see staticshadows.js)
+  // ==========================================================================
+
+  /**
+   * Render the sun depth of all STATIC geometry once into the baked map.
+   *
+   * Runs on the frame loop's own `_draw` classification (same caster set the
+   * cascades would take), minus everything dynamic: skinned actors, the probe
+   * scaffold, and the whole `ai` subtree (soldiers, grenades, blob shadows).
+   * Distance-LOD batches hidden this frame are still static, so they are
+   * force-shown for the bake and restored after. Transparent/prepass opt-outs
+   * never reach `_draw` in the first place.
+   */
+  _bakeStaticShadows() {
+    const B = this.baked;
+    const ctx = this.ctx;
+    const world = ctx.peek('world');
+    const bounds = world?.bounds;
+    if (!bounds) return; // no level yet: stay fully lit (shader flag stays off)
+    const aiRoot = ctx.peek('ai')?.root ?? null;
+
+    const list = this._bakeList ?? (this._bakeList = []);
+    let n = 0;
+    for (let i = 0; i < this._nDraw; i++) {
+      const o = this._draw[i];
+      const ud = o.userData;
+      if (ud.owNoShadow === true || ud.owProbe === true) continue;
+      if (o.isSkinnedMesh === true) continue;
+      let p = o.parent;
+      let dyn = false;
+      while (p) {
+        if (p === aiRoot) {
+          dyn = true;
+          break;
+        }
+        p = p.parent;
+      }
+      if (dyn) continue;
+      list[n++] = o;
+    }
+    // LOD-hidden batches are static too: show them for the bake, restore after.
+    const lodExtras = this._bakeLod ?? (this._bakeLod = []);
+    let nLod = 0;
+    const lodGroups = world.A?.lodGroups;
+    if (lodGroups) {
+      for (let i = 0; i < lodGroups.length; i++) {
+        const im = lodGroups[i];
+        if (im.visible !== false) continue;
+        if (im.userData.owNoShadow === true) continue;
+        im.visible = true;
+        lodExtras[nLod++] = im;
+        list[n++] = im;
+      }
+    }
+    if (n === 0) {
+      for (let i = 0; i < nLod; i++) lodExtras[i].visible = false;
+      return;
+    }
+
+    this._hideList(this._draw, this._nDraw);
+    for (let i = 0; i < n; i++) list[i].visible = true;
+    const bg = ctx.scene.background;
+    ctx.scene.background = null;
+    B.fit(this.sunDir, bounds);
+    B.renderStatic(this.renderer, ctx.scene, this.csm.depthMaterial);
+    ctx.scene.background = bg;
+    this._showList(this._draw, this._nDraw);
+    for (let i = 0; i < nLod; i++) lodExtras[i].visible = false;
+    B.finish(this.frame, this.sunDir);
+  }
+
+  // ==========================================================================
   //  the frame
   // ==========================================================================
 
@@ -1317,6 +1518,19 @@ export class RenderSystem {
       this._showList(this._noShadow, this._nNoShadow);
       this._showList(this._hide, this._nHide);
       scene.background = bg;
+    }
+
+    // ---- 2b. baked static shadows -------------------------------------------
+    // Low preset: the cascades above stay off and the sun depth of all static
+    // geometry is rendered once into a world-covering map instead (see
+    // staticshadows.js). Re-bakes only when the sun has visibly moved, so a
+    // fixed time of day pays exactly one depth render. Held until the probe
+    // scaffold is gone and the LOD states have settled, so neither bakes in.
+    if (this.baked.enabled && !this.probeActive && this.frame > 6) {
+      const moved = this.baked.lastSun.dot(this.sunDir) < REBAKE_DOT;
+      if (!this.baked.baked || (moved && this.frame - this.baked.lastFrame > REBAKE_INTERVAL)) {
+        this._bakeStaticShadows();
+      }
     }
 
     // ---- 3. TAA jitter ----------------------------------------------------
@@ -1665,6 +1879,7 @@ export class RenderSystem {
 
   dispose() {
     this.csm.dispose();
+    this.baked?.dispose();
     this.gbuffer.dispose();
     this.gtao?.dispose();
     this.contact?.dispose();

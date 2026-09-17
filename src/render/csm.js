@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { BAKED_GLSL } from './staticshadows.js';
 
 /**
  * Cascaded shadow maps, done properly.
@@ -32,6 +33,10 @@ const _rel = new THREE.Vector3();
 
 export class CascadedShadowMaps {
   constructor(renderer, opts) {
+    // `cascades` is the ACTIVE count; the cameras/matrices/fit arrays are
+    // always length 4 so shared uniform shapes never change across a runtime
+    // quality switch (see RenderSystem.applyQuality) — update() parks unused
+    // splits at 1e9 and render() only draws the active ones.
     this.renderer = renderer;
     this.cascades = Math.max(1, Math.min(4, opts.cascades | 0));
     // 4 x 4096 x R32F is a quarter of a gigabyte for shadows nobody can see.
@@ -57,7 +62,7 @@ export class CascadedShadowMaps {
 
     this.cameras = [];
     this.matrices = [];
-    for (let i = 0; i < this.cascades; i++) {
+    for (let i = 0; i < 4; i++) {
       const c = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 1000);
       c.matrixAutoUpdate = false;
       this.cameras.push(c);
@@ -104,22 +109,22 @@ export class CascadedShadowMaps {
       `,
     });
 
-    this._splits = new Float32Array(this.cascades + 1);
+    this._splits = new Float32Array(5);
     this._prevClear = new THREE.Color();
 
     // ---- per-cascade caster culling ---------------------------------------
     // World-space fit of each cascade, kept so `render()` can reject casters
     // that cannot possibly darken a texel this cascade is ever sampled at.
     this._fitCenter = [];
-    this._fitRadius = new Float32Array(this.cascades);
-    this._fitBack = new Float32Array(this.cascades);
-    for (let i = 0; i < this.cascades; i++) this._fitCenter.push(new THREE.Vector3());
+    this._fitRadius = new Float32Array(4);
+    this._fitBack = new Float32Array(4);
+    for (let i = 0; i < 4; i++) this._fitCenter.push(new THREE.Vector3());
     this._sunAxis = new THREE.Vector3(0, 1, 0);
     /** Objects this pass hid, so it can restore exactly those and no others. */
     this._culled = [];
     this._nCulled = 0;
     /** Diagnostics: casters submitted per cascade on the last frame. */
-    this.casterCounts = new Int32Array(this.cascades);
+    this.casterCounts = new Int32Array(4);
     /** Diagnostics: cascades skipped entirely on the last frame. */
     this.emptyCascades = 0;
   }
@@ -463,6 +468,12 @@ export function csmShaderChunk(cascades, quality) {
 
   // Sampler-array-free: one 2D array texture, so the layer index can be
   // dynamic. No unrolling needed.
+  //
+  // The baked static shadow map (see staticshadows.js) is declared BEFORE
+  // owSunShadow — GLSL needs the declaration first — and sampled by it: when
+  // the cascades are off (low preset) it IS the sun shadow; when they are on
+  // it is disabled by uniform and returns 1.0, which keeps this whole change
+  // pixel-neutral on every other preset.
   return /* glsl */ `
 #define OW_CASCADES ${cascades}
 #define OW_BLOCKER_TAPS ${blockerTaps}
@@ -479,6 +490,7 @@ uniform vec2 owCsmMapSize;
 uniform vec3 owSunDirView;
 uniform vec3 owSunDirWorld;
 uniform vec4 owCsmParams;
+${BAKED_GLSL}
 
 float owIGNoise( vec2 p ) {
   return fract( 52.9829189 * fract( dot( p, vec2( 0.06711056, 0.00583715 ) ) ) );
@@ -543,16 +555,21 @@ float owCsmCascade( int c, vec3 wPos, vec3 wN, float NdL, float rot ) {
 
 // posView / nrmView are three's view-space geometryPosition / geometryNormal.
 float owSunShadow( vec3 lightDirView, vec3 posView, vec3 nrmView ) {
-  if ( owCsmParams.x <= 0.0 ) return 1.0;
   if ( dot( lightDirView, owSunDirView ) < 0.999 ) return 1.0;
-
-  float vd = -posView.z;
-  if ( vd >= owCsmSplit[ OW_CASCADES - 1 ] ) return 1.0;
 
   vec3 wPos = cameraPosition + ( posView * mat3( viewMatrix ) );
   vec3 wN = normalize( nrmView * mat3( viewMatrix ) );
   float NdL = dot( wN, owSunDirWorld );
   if ( NdL <= 0.0 ) return 1.0;
+
+  // The baked static map covers the whole level, far past the last cascade,
+  // so receivers outside CSM range still get it — and when the cascades are
+  // off entirely it is the whole shadow term.
+  float baked = owBakedShadow( wPos, wN, NdL );
+  if ( owCsmParams.x <= 0.0 ) return baked;
+
+  float vd = -posView.z;
+  if ( vd >= owCsmSplit[ OW_CASCADES - 1 ] ) return baked;
 
   float rot = owIGNoise( gl_FragCoord.xy + owCsmParams.w ) * 6.2831853;
 
@@ -576,7 +593,7 @@ float owSunShadow( vec3 lightDirView, vec3 posView, vec3 nrmView ) {
                               owCsmSplit[ OW_CASCADES - 1 ] * 0.88, vd );
   s = mix( 1.0, s, fadeOut );
 
-  return mix( 1.0, s, owCsmParams.x );
+  return mix( 1.0, s, owCsmParams.x ) * baked;
 }
 `;
 }

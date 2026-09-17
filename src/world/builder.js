@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Accum, trs } from './util.js';
 import { PALETTE } from './palette.js';
+import { consolidateSmallBatches, updateLodStaggered } from './batch.js';
 
 /**
  * WORLD — the assembler.
@@ -25,7 +26,6 @@ const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
 const _m = new THREE.Matrix4();
 const _xm = new THREE.Matrix4();
 const _v = new THREE.Vector3();
-const _sph = new THREE.Sphere();
 const _q = new THREE.Quaternion();
 const _one = new THREE.Vector3(1, 1, 1);
 const _UP = new THREE.Vector3(0, 1, 0);
@@ -334,6 +334,20 @@ export class Assembler {
       this.stats.drawCalls++;
     }
 
+    // --- small-batch consolidation ---
+    // Prototypes with only a handful of instances share a material but would
+    // each cost a full InstancedMesh draw through forward + prepass + 4x CSM.
+    // Bake them into one merged static mesh per material instead (build time
+    // only; pixel-neutral — see batch.js). Consumed prototypes are left empty
+    // so the instanced pass below skips them.
+    {
+      const r = consolidateSmallBatches(this, root);
+      if (r.consumedProtos > 0) {
+        this.stats.batchedProtos = (this.stats.batchedProtos ?? 0) + r.consumedProtos;
+        this.stats.batchedInstances = (this.stats.batchedInstances ?? 0) + r.consumedInstances;
+      }
+    }
+
     // --- instanced props ---
     for (const p of this._protos.values()) {
       const n = p.matrices.length;
@@ -425,16 +439,16 @@ export class Assembler {
     return this;
   }
 
-  /** Distance LOD for prop clouds: cheap, per-mesh, no per-frame allocation. */
-  updateLod(camera) {
-    for (let i = 0; i < this.lodGroups.length; i++) {
-      const im = this.lodGroups[i];
-      const s = im.boundingSphere;
-      if (!s) continue;
-      _sph.copy(s);
-      const d = _v.copy(camera.position).distanceTo(_sph.center) - _sph.radius;
-      im.visible = d < im.userData.owLodDist;
-    }
+  /**
+   * Distance LOD for prop clouds: cheap, per-mesh, no per-frame allocation.
+   *
+   * Staggered: each entry is tested once every 4 frames (round-robin by index)
+   * and the test itself is sqrt-free. A LOD flip landing 1-3 frames late is
+   * invisible at these distances; running the whole list every frame is not.
+   */
+  updateLod(camera, frame = 0) {
+    _v.copy(camera.position);
+    updateLodStaggered(this.lodGroups, _v, frame);
   }
 
   dispose() {
