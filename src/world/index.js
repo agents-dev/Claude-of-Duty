@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { Assembler } from './builder.js';
+import { optimizeGroup } from './batch.js';
 import { BUILDINGS, STREET, SET_PIECES, GATE } from './layout.js';
 import { buildGround } from './ground.js';
 import { buildBuilding, collapseRoof } from './buildings.js';
@@ -14,6 +15,7 @@ import {
   groundY,
   isOpen,
 } from './dressing.js';
+export { optimizeGroup, mergeStatic, instanceDuplicates, freezeStatic } from './batch.js';
 
 /**
  * WORLD — level geometry, the modular building kit, props, set dressing and
@@ -46,10 +48,14 @@ import {
  *   world.groundHeight(x, z)  cheap analytic floor height (physics is exact)
  *   world.isOpen(x, z)        true where a character can stand outdoors
  *   world.stats               { staticTris, instTris, instances, drawCalls }
- *   world.prewarmMaterials()  compile every shader permutation the world can
- *                             produce, before the frame loop starts. Awaitable.
- *                             Call it from src/core/prewarm.js — see the method.
- *   world.levelToWorld(x,y,z,out) / world.worldToLevel(x,y,z,out)
+  *   world.prewarmMaterials()  compile every shader permutation the world can
+  *                             produce, before the frame loop starts. Awaitable.
+  *                             Call it from src/core/prewarm.js — see the method.
+  *   world.optimizeGroup(group, opts) batch a static Group: merge meshes that
+  *                             share a material, instance duplicates, freeze
+  *                             matrices (see batch.js). Other subsystems can use
+  *                             it for their own static groups.
+  *   world.levelToWorld(x,y,z,out) / world.worldToLevel(x,y,z,out)
  */
 
 /**
@@ -151,12 +157,17 @@ export class WorldSystem {
       new THREE.Vector3(62, 26, 62)
     ).applyMatrix4(A.xform);
     this.stats = A.stats;
+    // Distance-LOD throttle state (see update()): the visibility result only
+    // changes when the camera moves, so re-testing every frame is pure waste.
+    this._lodLast = new THREE.Vector3(1e9, 0, 0);
+    this._lodFrame = -1e9;
 
     const ms = performance.now() - t0;
     console.info(
       `[world] built in ${ms.toFixed(0)}ms — ${(A.stats.staticTris / 1000).toFixed(0)}k static tris, ` +
         `${(A.stats.instTris / 1000).toFixed(0)}k instanced tris in ${A.stats.instances} instances, ` +
-        `${A.stats.drawCalls} draw calls, ${(A.stats.collideTris / 1000).toFixed(1)}k collision tris`
+        `${A.stats.drawCalls} draw calls, ${(A.stats.collideTris / 1000).toFixed(1)}k collision tris, ` +
+        `${A.stats.frozen ?? 0} frozen`
     );
   }
 
@@ -309,8 +320,21 @@ export class WorldSystem {
 
   // ---------------------------------------------------------------- runtime --
   update(dt, ctx) {
-    // Distance LOD for the scatter clouds: one bounding-sphere test per batch.
-    this.A?.updateLod(ctx.camera);
+    // Distance LOD for the scatter clouds, throttled: one bounding-sphere test
+    // per batch, re-run at most every 6 frames AND only once the camera moved
+    // > 0.5 m since the last pass. Visibility between passes is unchanged —
+    // the spheres carry metres of slack (see builder maxDist) — so this saves
+    // the per-frame walk for the common case of a stationary shooter at zero
+    // visual cost.
+    const cam = ctx.camera;
+    if (this.A && ctx.time.frame - this._lodFrame >= 6) {
+      cam.getWorldPosition(this._v);
+      if (this._v.distanceToSquared(this._lodLast) > 0.25) {
+        this._lodLast.copy(this._v);
+        this._lodFrame = ctx.time.frame;
+        this.A.updateLod(cam);
+      }
+    }
 
     // Street lamps come on as the sun goes down, driven by the sky's real solar
     // altitude rather than a timer, so it is right at any time of day.
@@ -406,6 +430,16 @@ export class WorldSystem {
   }
 
   // ---------------------------------------------------------------- queries --
+  /**
+   * Batch a static Group owned by any subsystem: merge meshes that share a
+   * material, convert duplicate geometry into InstancedMesh, freeze matrices.
+   * See batch.js. Only touches meshes with matrixAutoUpdate === false, so
+   * animated objects are never modified. Returns stats.
+   */
+  optimizeGroup(group, opts) {
+    return optimizeGroup(group, opts);
+  }
+
   spawn(i = 0) {
     const n = this.spawnPoints.length;
     return this.spawnPoints[((i % n) + n) % n];

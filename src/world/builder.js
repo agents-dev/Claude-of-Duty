@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Accum, trs } from './util.js';
 import { PALETTE } from './palette.js';
+import { freezeStatic } from './batch.js';
 
 /**
  * WORLD — the assembler.
@@ -32,11 +33,14 @@ const _UP = new THREE.Vector3(0, 1, 0);
 
 /**
  * Spatial bucket size for chunked instance clouds (frustum culling + LOD).
- * Sized so a 120 m map splits into a handful of buckets: finer chunking culls a
+ * Sized so a 120 m map splits into ~2x2 buckets: finer chunking culls a
  * little better but multiplies draw calls through the prepass and four shadow
- * cascades, which is the wrong trade at this map size.
+ * cascades (every bucket is re-drawn by every pass), which is the wrong trade
+ * at this map size. Buckets only split above MIN_CHUNK_INSTANCES (below that,
+ * one InstancedMesh culls just as well with a single draw call).
  */
-const CHUNK = 64;
+const CHUNK = 96;
+const MIN_CHUNK_INSTANCES = 64;
 
 export class Assembler {
   constructor({ materials, rng, render }) {
@@ -342,7 +346,7 @@ export class Assembler {
         continue;
       }
       const buckets = new Map();
-      if (p.chunk && n > 24) {
+      if (p.chunk && n > MIN_CHUNK_INSTANCES) {
         for (let i = 0; i < n; i++) {
           const m = p.matrices[i];
           const gx = Math.floor(m.elements[12] / CHUNK);
@@ -380,6 +384,10 @@ export class Assembler {
         }
         for (let j = 0; j < list.length; j++) im.setMatrixAt(j, p.matrices[list[j]]);
         im.instanceMatrix.needsUpdate = true;
+        // Instance transforms never change after build: hint the driver to
+        // place the buffer once instead of streaming it.
+        im.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+        if (im.instanceColor) im.instanceColor.setUsage(THREE.StaticDrawUsage);
         im.computeBoundingSphere();
         im.updateMatrix();
         root.add(im);
@@ -422,6 +430,16 @@ export class Assembler {
       root.add(light);
       this.render?.addLight?.(light, opts);
     }
+
+    // --- batch freeze --------------------------------------------------
+    // Nothing under root moves after this point (LOD only flips `visible`,
+    // which needs no matrix update), so bake world matrices once and opt the
+    // whole static subtree out of the renderer's per-frame matrix walk. The
+    // level is re-drawn by 4 shadow cascades + prepass + forward every frame,
+    // and each of those walks paid for matrices that never change.
+    // Pixel-neutral: identical matrices, computed once. See batch.js.
+    const frozen = freezeStatic(root);
+    this.stats.frozen = frozen.frozen;
     return this;
   }
 
