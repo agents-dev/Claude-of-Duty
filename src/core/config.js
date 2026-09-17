@@ -20,19 +20,24 @@ export const UNITS = {
 
 export const QUALITY_PRESETS = {
   low: {
-    renderScale: 0.72,
+    renderScale: 0.6,
     shadowMapSize: 1024,
-    cascades: 3,
-    shadowDistance: 60,
+    cascades: 2,
+    shadowDistance: 45,
     taa: false,
     gtao: false,
     ssr: false,
     volumetrics: false,
     motionBlur: false,
-    bloom: true,
-    anisotropy: 4,
-    particleBudget: 2000,
-    decalBudget: 64,
+    bloom: false,
+    anisotropy: 2,
+    particleBudget: 1200,
+    decalBudget: 32,
+    // WORLD batch-combine (see src/world/builder.js): bake tiny instanced
+    // protos into the static batches, disable chunking, shorten detail LOD.
+    worldCombine: true,
+    propDistScale: 0.6,
+    maxPixelRatio: 1,
   },
   medium: {
     renderScale: 0.85,
@@ -48,6 +53,9 @@ export const QUALITY_PRESETS = {
     anisotropy: 8,
     particleBudget: 6000,
     decalBudget: 128,
+    worldCombine: false,
+    propDistScale: 1,
+    maxPixelRatio: 1.5,
   },
   high: {
     renderScale: 1.0,
@@ -63,6 +71,9 @@ export const QUALITY_PRESETS = {
     anisotropy: 16,
     particleBudget: 12000,
     decalBudget: 256,
+    worldCombine: false,
+    propDistScale: 1,
+    maxPixelRatio: 1.5,
   },
   ultra: {
     renderScale: 1.0,
@@ -78,6 +89,9 @@ export const QUALITY_PRESETS = {
     anisotropy: 16,
     particleBudget: 24000,
     decalBudget: 512,
+    worldCombine: false,
+    propDistScale: 1,
+    maxPixelRatio: 1.5,
   },
 };
 

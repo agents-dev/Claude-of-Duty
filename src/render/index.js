@@ -866,7 +866,11 @@ export class RenderSystem {
   // ==========================================================================
 
   resize(w, h, ctx) {
-    const pr = Math.min(globalThis.devicePixelRatio || 1, 1.5);
+    // Low-spec GPUs are fill-rate bound: cap devicePixelRatio at 1 so a
+    // Retina laptop does not shade 3.34 MP of HDR + prepass + post. The cap
+    // comes from the quality preset (see src/core/config.js).
+    const prCap = this.q.maxPixelRatio ?? 1.5;
+    const pr = Math.min(globalThis.devicePixelRatio || 1, prCap);
     this.renderer.setPixelRatio(pr);
     this.renderer.setSize(w, h, false);
 

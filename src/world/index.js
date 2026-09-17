@@ -103,7 +103,16 @@ export class WorldSystem {
     materials.setGroundLevel?.(0);
 
     const t0 = performance.now();
-    const A = new Assembler({ materials, rng, render });
+    // Low-spec batch combine: quality `low` bakes tiny protos into the static
+    // batches, disables chunking and shortens detail LOD (see builder.js).
+    // Every other preset takes the identical path it always did.
+    const A = new Assembler({
+      materials,
+      rng,
+      render,
+      lowSpec: ctx.config?.q?.worldCombine === true,
+      propDistScale: ctx.config?.q?.propDistScale ?? 1,
+    });
     this.A = A;
     A.setTransform(LEVEL_YAW, LEVEL_TX, LEVEL_TZ);
 
@@ -156,7 +165,8 @@ export class WorldSystem {
     console.info(
       `[world] built in ${ms.toFixed(0)}ms — ${(A.stats.staticTris / 1000).toFixed(0)}k static tris, ` +
         `${(A.stats.instTris / 1000).toFixed(0)}k instanced tris in ${A.stats.instances} instances, ` +
-        `${A.stats.drawCalls} draw calls, ${(A.stats.collideTris / 1000).toFixed(1)}k collision tris`
+        `${A.stats.drawCalls} draw calls, ${(A.stats.collideTris / 1000).toFixed(1)}k collision tris` +
+        (A.stats.bakedProtos > 0 ? `, baked ${A.stats.bakedProtos} protos (${A.stats.bakedInstances} inst)` : '')
     );
   }
 

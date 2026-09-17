@@ -38,11 +38,29 @@ const _UP = new THREE.Vector3(0, 1, 0);
  */
 const CHUNK = 64;
 
+/**
+ * Max instances a prototype may hold and still be baked into the static batch
+ * on low-spec GPUs. One InstancedMesh is one draw call in the forward pass
+ * PLUS one in the prepass PLUS one per shadow cascade — so a prop placed 3
+ * times costs ~5-6 draws. Baking it is free: the vertices join a batch that
+ * is drawn anyway. The threshold is deliberately small so the bake only ever
+ * touches structural one-offs (lamps, tanks, stalls); high-count scatter
+ * keeps its instancing and its culling.
+ */
+const LOW_SPEC_BAKE_MAX = 8;
+
 export class Assembler {
-  constructor({ materials, rng, render }) {
+  constructor({ materials, rng, render, lowSpec = false, propDistScale = 1 }) {
     this.materials = materials;
     this.rng = rng;
     this.render = render;
+    /**
+     * Low-spec batch combine (quality `low` only — see src/core/config.js).
+     * High/medium/ultra take the identical path they always did; this flag
+     * only ever REMOVES draw calls on low, never changes a vertex.
+     */
+    this.lowSpec = !!lowSpec;
+    this.propDistScale = propDistScale ?? 1;
     this._mats = new Map(); // palette key -> THREE.Material
     this._static = new Map(); // palette key -> Accum
     this._protos = new Map(); // id -> { geo, key, instances[], masks[], opts }
@@ -76,7 +94,7 @@ export class Assembler {
      * not on the ground, and a dust ring floating at 60 cm is worse than none.
      */
     this.skirts = true;
-    this.stats = { staticTris: 0, instTris: 0, instances: 0, drawCalls: 0, collideTris: 0 };
+    this.stats = { staticTris: 0, instTris: 0, instances: 0, drawCalls: 0, collideTris: 0, bakedProtos: 0, bakedInstances: 0 };
   }
 
   // -------------------------------------------------------------- transform --
@@ -316,7 +334,44 @@ export class Assembler {
   // ------------------------------------------------------------- finalize --
   /** Build the meshes, add them to `root`, register collision with physics. */
   finalize(root, physics) {
-    // --- merged static geometry ---
+    // --- low-spec batch combine (runs BEFORE the static build) ---
+    // Tiny structural protos are merged into the static Accum for their palette
+    // key, so they ride a batch that is drawn anyway instead of costing their
+    // own draw in the forward pass + prepass + every shadow cascade.
+    // Conditions keep it pixel-safe: shadow flags must match the static batch
+    // (both true), no prepass opt-outs, no LOD. Instance tint masks become
+    // vertex masks via Accum's `masks` opt.
+    if (this.lowSpec) {
+      for (const p of this._protos.values()) {
+        const n = p.matrices.length;
+        if (n === 0 || n > LOW_SPEC_BAKE_MAX) continue;
+        if (p.maxDist > 0) continue;
+        if (p.castShadow === false || p.receiveShadow === false || p.noPrepass) continue;
+        // Shorten detail LOD ranges below; this proto has none, bake it.
+        let acc = this._static.get(p.key);
+        if (!acc) {
+          acc = new Accum(`world:${p.key}`);
+          this._static.set(p.key, acc);
+        }
+        for (let i = 0; i < n; i++) {
+          const mk = p.masks[i];
+          acc.add(p.geo, p.matrices[i], mk ? { masks: mk } : null);
+        }
+        this.stats.bakedProtos++;
+        this.stats.bakedInstances += n;
+        p.matrices.length = 0;
+        p.masks.length = 0;
+        p.geo.dispose();
+        p.baked = true;
+      }
+      // Shorten detail LOD ranges so scatter clouds drop out sooner. Applied
+      // at build time so updateLod() needs no per-frame branch.
+      for (const p of this._protos.values()) {
+        if (!p.baked && p.maxDist > 0) p.maxDist *= this.propDistScale;
+      }
+    }
+
+    // --- merged static geometry (includes baked low-spec protos) ---
     for (const [key, acc] of this._static) {
       if (acc.empty) continue;
       const geo = acc.build();
@@ -336,13 +391,19 @@ export class Assembler {
 
     // --- instanced props ---
     for (const p of this._protos.values()) {
+      if (p.baked) continue;
       const n = p.matrices.length;
       if (n === 0) {
         p.geo.dispose();
         continue;
       }
+      // Low-spec disables chunking: one InstancedMesh per prototype. Chunking
+      // buys frustum culling at the price of one draw call per chunk in the
+      // forward pass, the prepass AND every shadow cascade — the wrong trade
+      // when the GPU is draw-call bound.
+      const doChunk = p.chunk && !this.lowSpec && n > 24;
       const buckets = new Map();
-      if (p.chunk && n > 24) {
+      if (doChunk) {
         for (let i = 0; i < n; i++) {
           const m = p.matrices[i];
           const gx = Math.floor(m.elements[12] / CHUNK);
@@ -357,10 +418,15 @@ export class Assembler {
       }
 
       const mat = this.mat(p.key);
+      // Low-spec: detail scatter (LOD'd) skips the shadow cascades. These are
+      // pebbles, litter, cans — sub-pixel in the 1024px low cascade anyway —
+      // and each caster costs a draw per cascade. Static + structural props
+      // still cast.
+      const castShadow = this.lowSpec && p.maxDist > 0 ? false : p.castShadow;
       for (const list of buckets.values()) {
         const im = new THREE.InstancedMesh(p.geo, mat, list.length);
         im.name = `prop_${p.id}`;
-        im.castShadow = p.castShadow;
+        im.castShadow = castShadow;
         im.receiveShadow = p.receiveShadow;
         im.matrixAutoUpdate = false;
         im.userData.surface = this.surfaceOf(p.key);
