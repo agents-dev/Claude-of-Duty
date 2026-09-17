@@ -142,6 +142,10 @@ export class Input {
 
   _onMouseDown(e) {
     if (!this.enabled) return;
+    // Clicks on UI (pause menu, touch buttons, HUD) must never lock the
+    // pointer nor leak into gameplay as fire input: only the canvas itself
+    // starts a lock. Menu resume re-locks explicitly via close().
+    if (e.target !== this.canvas) return;
     if (!this.pointerLocked && e.button === 0) this.requestPointerLock();
     this._pendingDown.add(`Mouse${e.button}`);
   }
