@@ -156,7 +156,10 @@ export class WorldSystem {
     console.info(
       `[world] built in ${ms.toFixed(0)}ms — ${(A.stats.staticTris / 1000).toFixed(0)}k static tris, ` +
         `${(A.stats.instTris / 1000).toFixed(0)}k instanced tris in ${A.stats.instances} instances, ` +
-        `${A.stats.drawCalls} draw calls, ${(A.stats.collideTris / 1000).toFixed(1)}k collision tris`
+        `${A.stats.drawCalls} draw calls, ${(A.stats.collideTris / 1000).toFixed(1)}k collision tris` +
+        (A.stats.batchedProtos
+          ? ` (batch: ${A.stats.batchedProtos} small protos / ${A.stats.batchedInstances} instances merged to static)`
+          : '')
     );
   }
 
@@ -291,9 +294,18 @@ export class WorldSystem {
         continue;
       }
       // The renderer's test, verbatim: fade = 1 - smoothstep(d, .75r, 1.15r),
-      // light.visible = fade > 0.002.
-      const d = l.position.distanceTo(this._camPos);
-      if (1 - THREE.MathUtils.smoothstep(d, range * 0.75, range * 1.15) > 0.002) n++;
+      // light.visible = fade > 0.002. Sqrt-free: fully inside .75r is visible
+      // and fully outside 1.15r is not, with no root taken; only the narrow
+      // crossing band pays for distanceTo + smoothstep.
+      const d2 = l.position.distanceToSquared(this._camPos);
+      const inner = range * 0.75;
+      if (d2 <= inner * inner) {
+        n++;
+        continue;
+      }
+      const outer = range * 1.15;
+      if (d2 >= outer * outer) continue;
+      if (1 - THREE.MathUtils.smoothstep(Math.sqrt(d2), inner, outer) > 0.002) n++;
     }
 
     // A subsystem can always out-run the pool; adopting the higher count costs
@@ -309,8 +321,9 @@ export class WorldSystem {
 
   // ---------------------------------------------------------------- runtime --
   update(dt, ctx) {
-    // Distance LOD for the scatter clouds: one bounding-sphere test per batch.
-    this.A?.updateLod(ctx.camera);
+    // Distance LOD for the scatter clouds: staggered round-robin, one
+    // bounding-sphere test per batch every 4th frame (see batch.js).
+    this.A?.updateLod(ctx.camera, ctx.time.frame);
 
     // Street lamps come on as the sun goes down, driven by the sky's real solar
     // altitude rather than a timer, so it is right at any time of day.
